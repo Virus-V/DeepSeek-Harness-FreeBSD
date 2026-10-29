@@ -9,15 +9,19 @@
 #   * node-pty has no freebsd prebuild, and its src/unix/pty.cc calls
 #     pty_close_inherited_fds(), which upstream defines for Linux only, so
 #     `node-gyp rebuild` fails with "use of undeclared identifier".
+#   * @deepseek-ai/node-addon-system (flock) allows darwin/linux only, so every
+#     session write dies with "flock is not supported on freebsd-x64" — even
+#     though FreeBSD has flock(2) and the package ships src/flock.c.
 #
 # What this script does:
 #   1. checks the environment (FreeBSD, Node >= 20, npm, build tools)
 #   2. installs @deepseek-ai/dsh with --ignore-scripts
-#   3. patches node-pty's pty.cc for FreeBSD and compiles it from source
-#   4. writes a launcher that runs dsh with --expose-internals + shim.js, which
+#   3. compiles src/flock.c into the flock binding session persistence needs
+#   4. patches node-pty's pty.cc for FreeBSD and compiles it from source
+#   5. writes a launcher that runs dsh with --expose-internals + shim.js, which
 #      replaces the missing native binding with a plain require()
-#   5. applies this bundle's dsh profile config (see apply-config.sh)
-#   6. links the launcher to ~/.local/bin/dsh
+#   6. applies this bundle's dsh profile config (see apply-config.sh)
+#   7. links the launcher to ~/.local/bin/dsh
 #
 # Usage: sh install.sh [options]
 #   --version <ver>   dsh version to install            (default 0.2.1-rc.2)
@@ -87,6 +91,13 @@ if command -v node-gyp >/dev/null 2>&1; then
 elif command -v npx >/dev/null 2>&1; then
 	GYP="npx --yes node-gyp"
 fi
+# The flock binding (needed by session persistence) is compiled with the system
+# C compiler, so cc is required even when the terminal feature is skipped.
+if ! command -v cc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+	warn "no C compiler (cc/clang): the flock binding cannot be built"
+	warn "dsh will start, but every session write will fail — install a compiler"
+	warn "and the node headers (they come with the node package: pkg install node)"
+fi
 if [ "$DO_PTY" -eq 1 ]; then
 	missing=""
 	for tool in cc make python3; do
@@ -115,6 +126,21 @@ npm install --ignore-scripts --no-audit --no-fund "@deepseek-ai/dsh@$VERSION" ||
 [ -f "$ROOT/app/node_modules/@deepseek-ai/dsh/lib/bin.js" ] ||
 	die "dsh entry point missing after install: $ROOT/app/node_modules/@deepseek-ai/dsh/lib/bin.js"
 printf '    dsh %s installed\n' "$(node -p "require('$ROOT/app/node_modules/@deepseek-ai/dsh/package.json').version")"
+
+# --------------------------------------------------------------------------
+# Session persistence takes an exclusive flock() on every session log, and the
+# upstream flock entry point refuses to run on anything but darwin/linux. This
+# step is not optional: without it dsh starts but every session write fails.
+step "building the FreeBSD flock binding"
+if [ -f "$SRC/patch-flock.mjs" ]; then
+	if ! node "$SRC/patch-flock.mjs" "$ROOT/app"; then
+		warn "flock binding was not built; dsh starts but cannot create sessions"
+		warn "session writes will reject with 'flock is not supported on freebsd-x64'"
+		warn "needs a C compiler and the node headers (pkg install node)"
+	fi
+else
+	warn "patch-flock.mjs is missing from this bundle"
+fi
 
 # --------------------------------------------------------------------------
 if [ "$DO_PTY" -eq 1 ] && [ -d "$ROOT/app/node_modules/node-pty" ]; then
